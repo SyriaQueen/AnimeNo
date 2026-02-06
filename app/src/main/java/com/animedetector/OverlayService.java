@@ -8,10 +8,14 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
+import android.graphics.Rect;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -29,54 +33,62 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.ImageView;
+import android.widget.TextView;
 
 import androidx.core.app.NotificationCompat;
 
 import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class OverlayService extends Service {
     private static final String TAG = "OverlayService";
     private static final String CHANNEL_ID = "AnimeDetectorChannel";
     private static final int NOTIFICATION_ID = 1;
-    private static final int FRAME_SKIP = 3; // معالجة كل 4 إطارات
+    private static final int FRAME_SKIP = 2;
+    
+    // ✅ إضافة: timeout لإخفاء المربعات بعد عدم الكشف
+    private static final long HIDE_TIMEOUT = 300; // 300ms بدون كشف = إخفاء
     
     private static final AtomicBoolean isServiceRunning = new AtomicBoolean(false);
     
-    // Media Projection
     private MediaProjectionManager projectionManager;
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
     
-    // Overlay View
     private WindowManager windowManager;
     private View overlayView;
     private ImageView overlayImageView;
+    private TextView statsText;
     
-    // Detection
     private OptimizedAnimeDetector detector;
     private DetectionSmoother smoother;
+    private PerformanceMonitor perfMonitor;
     
-    // Threading
     private HandlerThread captureThread;
     private Handler captureHandler;
     private HandlerThread detectionThread;
     private Handler detectionHandler;
+    private final Handler mainHandler = new Handler();
     
-    // Display metrics
     private int screenWidth;
     private int screenHeight;
     private int screenDensity;
     
-    // Control
     private final AtomicBoolean isProcessing = new AtomicBoolean(false);
-    private int frameCounter = 0;
+    private final AtomicInteger frameCounter = new AtomicInteger(0);
     
-    // Overlay bitmap
-    private Bitmap overlayBitmap;
+    private volatile Bitmap overlayBitmap;
     private final Object overlayLock = new Object();
+    
+    // ✅ Paint محسّن مع نمط
+    private final Paint censorPaint = new Paint();
+    private Bitmap patternBitmap; // النمط المخصص
+    
+    // ✅ إضافة: تتبع آخر كشف
+    private volatile long lastDetectionTime = 0;
+    private final Runnable hideOverlayRunnable = this::hideOverlayIfNeeded;
     
     public static boolean isRunning() {
         return isServiceRunning.get();
@@ -85,21 +97,17 @@ public class OverlayService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        
         Log.i(TAG, "Service created");
         
-        // تهيئة المكونات
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
         
-        // الحصول على أبعاد الشاشة
         DisplayMetrics metrics = new DisplayMetrics();
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
         screenWidth = metrics.widthPixels;
         screenHeight = metrics.heightPixels;
         screenDensity = metrics.densityDpi;
         
-        // تهيئة threads
         captureThread = new HandlerThread("CaptureThread");
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
@@ -108,17 +116,56 @@ public class OverlayService extends Service {
         detectionThread.start();
         detectionHandler = new Handler(detectionThread.getLooper());
         
-        // تهيئة الكاشف
+        // ✅ إنشاء النمط المخصص
+        createCensorPattern();
+        
         try {
             detector = new OptimizedAnimeDetector(this);
             smoother = new DetectionSmoother(5);
+            perfMonitor = new PerformanceMonitor();
         } catch (Exception e) {
-            Log.e(TAG, "Failed to initialize detector", e);
+            Log.e(TAG, "Failed to init detector", e);
             stopSelf();
             return;
         }
         
         isServiceRunning.set(true);
+    }
+    
+    /**
+     * ✅ إنشاء نمط حظر مخصص (أسود بالكامل مع texture)
+     */
+    private void createCensorPattern() {
+        censorPaint.setStyle(Paint.Style.FILL);
+        censorPaint.setAntiAlias(false);
+        
+        // إنشاء bitmap صغير للنمط
+        int patternSize = 40;
+        patternBitmap = Bitmap.createBitmap(patternSize, patternSize, Bitmap.Config.ARGB_8888);
+        Canvas patternCanvas = new Canvas(patternBitmap);
+        
+        // خلفية سوداء كاملة
+        patternCanvas.drawColor(Color.BLACK);
+        
+        // إضافة خطوط مائلة سوداء أغمق للنمط
+        Paint linePaint = new Paint();
+        linePaint.setColor(Color.argb(80, 0, 0, 0)); // أسود شبه شفاف
+        linePaint.setStrokeWidth(3);
+        linePaint.setAntiAlias(false);
+        
+        // رسم خطوط مائلة
+        for (int i = -patternSize; i < patternSize * 2; i += 8) {
+            patternCanvas.drawLine(i, 0, i + patternSize, patternSize, linePaint);
+        }
+        
+        // استخدام النمط في Paint
+        android.graphics.BitmapShader shader = new android.graphics.BitmapShader(
+            patternBitmap,
+            android.graphics.Shader.TileMode.REPEAT,
+            android.graphics.Shader.TileMode.REPEAT
+        );
+        
+        censorPaint.setShader(shader);
     }
     
     @Override
@@ -128,25 +175,19 @@ public class OverlayService extends Service {
             return START_NOT_STICKY;
         }
         
-        // بدء foreground service
         createNotificationChannel();
-        Notification notification = createNotification();
-        startForeground(NOTIFICATION_ID, notification);
+        startForeground(NOTIFICATION_ID, createNotification());
         
-        // الحصول على نتيجة screen capture
         int resultCode = intent.getIntExtra("resultCode", 0);
         Intent data = intent.getParcelableExtra("data");
         
         if (resultCode == 0 || data == null) {
-            Log.e(TAG, "Invalid screen capture data");
+            Log.e(TAG, "Invalid capture data");
             stopSelf();
             return START_NOT_STICKY;
         }
         
-        // بدء screen capture
         startScreenCapture(resultCode, data);
-        
-        // إنشاء overlay view
         createOverlayView();
         
         return START_STICKY;
@@ -155,12 +196,9 @@ public class OverlayService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID,
-                "Anime Detector",
-                NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "Anime Detector", NotificationManager.IMPORTANCE_LOW
             );
-            channel.setDescription("كاشف الأنمي يعمل");
-            
+            channel.setDescription("كاشف الأنمي");
             NotificationManager manager = getSystemService(NotificationManager.class);
             manager.createNotificationChannel(channel);
         }
@@ -169,13 +207,12 @@ public class OverlayService extends Service {
     private Notification createNotification() {
         Intent notificationIntent = new Intent(this, MainActivity.class);
         PendingIntent pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE
+            this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE
         );
         
         return new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Anime Detector")
-            .setContentText("🎯 يكشف الأنمي على الشاشة")
+            .setContentText("🎯 يكشف الأنمي")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -183,15 +220,12 @@ public class OverlayService extends Service {
     }
     
     private void startScreenCapture(int resultCode, Intent data) {
-        // إنشاء ImageReader
         imageReader = ImageReader.newInstance(
-            screenWidth, screenHeight,
-            PixelFormat.RGBA_8888, 2
+            screenWidth, screenHeight, PixelFormat.RGBA_8888, 2
         );
         
         imageReader.setOnImageAvailableListener(reader -> {
-            // Frame skipping
-            if (++frameCounter % (FRAME_SKIP + 1) != 0) {
+            if (frameCounter.incrementAndGet() % (FRAME_SKIP + 1) != 0) {
                 Image image = reader.acquireLatestImage();
                 if (image != null) image.close();
                 return;
@@ -203,32 +237,25 @@ public class OverlayService extends Service {
             }
         }, captureHandler);
         
-        // إنشاء MediaProjection
         mediaProjection = projectionManager.getMediaProjection(resultCode, data);
         
-        // إنشاء VirtualDisplay
         virtualDisplay = mediaProjection.createVirtualDisplay(
-            "AnimeDetector",
-            screenWidth, screenHeight, screenDensity,
+            "AnimeDetector", screenWidth, screenHeight, screenDensity,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader.getSurface(),
-            null, captureHandler
+            imageReader.getSurface(), null, captureHandler
         );
         
         Log.i(TAG, "Screen capture started");
     }
     
     private void createOverlayView() {
-        LayoutInflater inflater = LayoutInflater.from(this);
-        overlayView = inflater.inflate(R.layout.overlay_layout, null);
+        overlayView = LayoutInflater.from(this).inflate(R.layout.overlay_layout, null);
         overlayImageView = overlayView.findViewById(R.id.overlayImage);
+        statsText = overlayView.findViewById(R.id.statsText);
         
-        int layoutType;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            layoutType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-        } else {
-            layoutType = WindowManager.LayoutParams.TYPE_PHONE;
-        }
+        int layoutType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            : WindowManager.LayoutParams.TYPE_PHONE;
         
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -241,10 +268,9 @@ public class OverlayService extends Service {
         );
         
         params.gravity = Gravity.TOP | Gravity.START;
-        
         windowManager.addView(overlayView, params);
         
-        Log.i(TAG, "Overlay view created");
+        Log.i(TAG, "Overlay created");
     }
     
     private void processImage(Image image) {
@@ -253,34 +279,66 @@ public class OverlayService extends Service {
             return;
         }
         
+        perfMonitor.frameStart();
+        
         detectionHandler.post(() -> {
             try {
-                // تحويل Image إلى Bitmap
+                long start = System.currentTimeMillis();
+                
                 Bitmap bitmap = imageToBitmap(image);
                 
                 if (bitmap != null) {
-                    // الكشف
-                    OptimizedAnimeDetector.DetectionResult result = 
-                        detector.detect(bitmap);
+                    OptimizedAnimeDetector.DetectionResult result = detector.detect(bitmap);
+                    result = smoother.smooth(result);
                     
-                    // التنعيم
-                    if (smoother != null) {
-                        result = smoother.smooth(result);
+                    long elapsed = System.currentTimeMillis() - start;
+                    perfMonitor.frameEnd(elapsed);
+                    
+                    // ✅ تحديث وقت آخر كشف
+                    if (!result.detections.isEmpty()) {
+                        lastDetectionTime = System.currentTimeMillis();
                     }
                     
-                    // تحديث overlay
                     updateOverlay(result, bitmap.getWidth(), bitmap.getHeight());
+                    updateStats(result, elapsed);
+                    
+                    // ✅ جدولة فحص الإخفاء
+                    mainHandler.removeCallbacks(hideOverlayRunnable);
+                    mainHandler.postDelayed(hideOverlayRunnable, HIDE_TIMEOUT);
                     
                     bitmap.recycle();
                 }
                 
             } catch (Exception e) {
-                Log.e(TAG, "Error processing image", e);
+                Log.e(TAG, "Process error", e);
             } finally {
                 image.close();
                 isProcessing.set(false);
             }
         });
+    }
+    
+    /**
+     * ✅ إخفاء overlay إذا لم يكن هناك كشف لفترة
+     */
+    private void hideOverlayIfNeeded() {
+        long timeSinceLastDetection = System.currentTimeMillis() - lastDetectionTime;
+        
+        if (timeSinceLastDetection > HIDE_TIMEOUT) {
+            synchronized (overlayLock) {
+                if (overlayBitmap != null && !overlayBitmap.isRecycled()) {
+                    // مسح الـ overlay
+                    Canvas canvas = new Canvas(overlayBitmap);
+                    canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
+                    
+                    mainHandler.post(() -> {
+                        if (overlayImageView != null) {
+                            overlayImageView.setImageBitmap(overlayBitmap);
+                        }
+                    });
+                }
+            }
+        }
     }
     
     private Bitmap imageToBitmap(Image image) {
@@ -298,54 +356,49 @@ public class OverlayService extends Service {
         
         bitmap.copyPixelsFromBuffer(buffer);
         
-        // قص الـ padding إذا وُجد
         if (rowPadding != 0) {
-            Bitmap croppedBitmap = Bitmap.createBitmap(
-                bitmap, 0, 0, screenWidth, screenHeight
-            );
+            Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, screenWidth, screenHeight);
             bitmap.recycle();
-            return croppedBitmap;
+            return cropped;
         }
         
         return bitmap;
     }
     
-    private void updateOverlay(OptimizedAnimeDetector.DetectionResult result, 
-                               int width, int height) {
+    /**
+     * ✅ تحديث overlay مع النمط المخصص
+     */
+    private void updateOverlay(OptimizedAnimeDetector.DetectionResult result, int w, int h) {
         synchronized (overlayLock) {
-            // إنشاء bitmap للـ overlay
-            if (overlayBitmap == null || 
-                overlayBitmap.getWidth() != width || 
-                overlayBitmap.getHeight() != height ||
-                overlayBitmap.isRecycled()) {
+            if (overlayBitmap == null || overlayBitmap.getWidth() != w || 
+                overlayBitmap.getHeight() != h || overlayBitmap.isRecycled()) {
                 
                 if (overlayBitmap != null && !overlayBitmap.isRecycled()) {
                     overlayBitmap.recycle();
                 }
-                
-                overlayBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                overlayBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             }
             
             Canvas canvas = new Canvas(overlayBitmap);
-            canvas.drawColor(Color.TRANSPARENT);
             
+            // ✅ مسح الـ canvas بالكامل أولاً
+            canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
+            
+            // ✅ رسم المربعات بالنمط المخصص
             if (!result.detections.isEmpty()) {
-                Paint paint = new Paint();
-                paint.setColor(Color.argb(220, 0, 0, 0));
-                paint.setStyle(Paint.Style.FILL);
-                
                 for (OptimizedAnimeDetector.Detection det : result.detections) {
                     float margin = Math.min(det.width, det.height) * 0.05f;
+                    
+                    // رسم بالنمط المخصص (أسود كامل مع texture)
                     canvas.drawRect(
                         det.x1 - margin, det.y1 - margin,
                         det.x2 + margin, det.y2 + margin,
-                        paint
+                        censorPaint
                     );
                 }
             }
             
-            // تحديث UI
-            new Handler(getMainLooper()).post(() -> {
+            mainHandler.post(() -> {
                 if (overlayImageView != null) {
                     overlayImageView.setImageBitmap(overlayBitmap);
                 }
@@ -353,54 +406,54 @@ public class OverlayService extends Service {
         }
     }
     
+    private void updateStats(OptimizedAnimeDetector.DetectionResult result, long elapsed) {
+        mainHandler.post(() -> {
+            if (statsText != null) {
+                String stats = String.format(
+                    "🎯 %d | ⚡%dms | 📊%.0f%% | FPS:%.1f",
+                    result.detections.size(),
+                    elapsed,
+                    result.avgConfidence * 100,
+                    perfMonitor.getCurrentFPS()
+                );
+                statsText.setText(stats);
+            }
+        });
+    }
+    
     @Override
     public void onDestroy() {
         isServiceRunning.set(false);
         
-        // إيقاف screen capture
-        if (virtualDisplay != null) {
-            virtualDisplay.release();
-        }
+        // ✅ إزالة callbacks
+        mainHandler.removeCallbacks(hideOverlayRunnable);
         
-        if (mediaProjection != null) {
-            mediaProjection.stop();
-        }
+        if (virtualDisplay != null) virtualDisplay.release();
+        if (mediaProjection != null) mediaProjection.stop();
+        if (imageReader != null) imageReader.close();
         
-        if (imageReader != null) {
-            imageReader.close();
-        }
-        
-        // إزالة overlay
         if (overlayView != null && windowManager != null) {
             windowManager.removeView(overlayView);
         }
         
-        // تنظيف resources
         synchronized (overlayLock) {
             if (overlayBitmap != null && !overlayBitmap.isRecycled()) {
                 overlayBitmap.recycle();
             }
         }
         
-        if (detector != null) {
-            detector.close();
+        // ✅ تنظيف النمط
+        if (patternBitmap != null && !patternBitmap.isRecycled()) {
+            patternBitmap.recycle();
         }
         
-        if (smoother != null) {
-            smoother.clear();
-        }
+        if (detector != null) detector.close();
+        if (smoother != null) smoother.clear();
         
-        // إيقاف threads
-        if (captureThread != null) {
-            captureThread.quitSafely();
-        }
-        
-        if (detectionThread != null) {
-            detectionThread.quitSafely();
-        }
+        if (captureThread != null) captureThread.quitSafely();
+        if (detectionThread != null) detectionThread.quitSafely();
         
         super.onDestroy();
-        
         Log.i(TAG, "Service destroyed");
     }
     
@@ -409,5 +462,3 @@ public class OverlayService extends Service {
         return null;
     }
 }
-
-
